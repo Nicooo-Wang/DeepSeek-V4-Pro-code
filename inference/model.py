@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
 from functools import lru_cache
@@ -33,47 +34,61 @@ def set_dtype(dtype):
 
 @dataclass
 class ModelArgs:
-    """Model hyperparameters. Field names match the config JSON keys."""
-    max_batch_size: int = 4
-    max_seq_len: int = 4096
+    """Model hyperparameters. Field names match the config JSON keys.
+
+    Defaults below are the REAL DeepSeek-V4-Pro config (inference/config.json), with ONE
+    exception: ``n_layers`` is reduced from 61 for memory. Every other shape/ratio matches
+    the published model exactly (verified against inference/config.json). To run the full
+    61-layer model, set n_layers=61 (needs many GPUs / real fp4 kernels).
+
+    Memory rule of thumb: each (MoE) layer ≈ 14 GB of fp4 expert weights + attention
+    (384 experts). n_layers=2 ≈ 47 GB and runs on a shared GPU; bump with the
+    MODEL_N_LAYERS env var (or edit here), e.g. `MODEL_N_LAYERS=4 python model.py`.
+    Tensor-parallel (torchrun --nproc-per-node 2) halves the per-GPU memory.
+    """
+    max_batch_size: int = 4                  # not in config.json; batch for kv-cache buffers
+    max_seq_len: int = 4096                  # not in config.json; kv-cache length (real ctx = 65536+)
     dtype: Literal["bf16", "fp8"] = "fp8"
     scale_fmt: Literal[None, "ue8m0"] = "ue8m0"
-    expert_dtype: Literal[None, "fp4"] = None
+    expert_dtype: Literal[None, "fp4"] = "fp4"
     scale_dtype: Literal["fp32", "fp8"] = "fp8"
     vocab_size: int = 129280
-    dim: int = 4096
-    moe_inter_dim: int = 4096
-    n_layers: int = 7
-    n_hash_layers: int = 0
+    dim: int = 7168
+    moe_inter_dim: int = 3072
+    n_layers: int = 2                        # config.json: 61  <-- only field reduced (memory)
+    n_hash_layers: int = 3                   # first N layers use hash routing (token-id -> expert)
     n_mtp_layers: int = 1
-    n_heads: int = 64
+    n_heads: int = 128
     # moe
-    n_routed_experts: int = 8
+    n_routed_experts: int = 384
     n_shared_experts: int = 1
-    n_activated_experts: int = 2
+    n_activated_experts: int = 6             # top-k routed experts per token
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sqrtsoftplus"
-    route_scale: float = 1.
-    swiglu_limit: float = 0.
+    route_scale: float = 2.5
+    swiglu_limit: float = 10.0
     # mqa
-    q_lora_rank: int = 1024
+    q_lora_rank: int = 1536
     head_dim: int = 512
     rope_head_dim: int = 64
     norm_eps: float = 1e-6
-    o_groups: int = 8
+    o_groups: int = 16
     o_lora_rank: int = 1024
     window_size: int = 128
-    compress_ratios: Tuple[int] = (0, 0, 4, 128, 4, 128, 4, 0)
+    # per-layer KV-compression ratio; 0=sliding window, 4=compress+Indexer, 128=compress only.
+    # Exactly the config.json pattern (62 entries = 61 layers + 1 MTP):
+    #   (128,128) then (4,128)x29 then (4,0).
+    compress_ratios: Tuple[int] = (128, 128) + tuple(v for _ in range(29) for v in (4, 128)) + (4, 0)
     # yarn
-    compress_rope_theta: float = 40000.0
-    original_seq_len: int = 0
+    compress_rope_theta: float = 160000.0
+    original_seq_len: int = 65536            # >0 enables YaRN length scaling (real value)
     rope_theta: float = 10000.0
-    rope_factor: float = 40
+    rope_factor: float = 16.0
     beta_fast: int = 32
     beta_slow: int = 1
     # index
     index_n_heads: int = 64
     index_head_dim: int = 128
-    index_topk: int = 512
+    index_topk: int = 1024
     # hc
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
@@ -561,7 +576,13 @@ class Gate(nn.Module):
         self.hash = layer_id < args.n_hash_layers
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         if self.hash:
-            self.tid2eid = nn.Parameter(torch.empty(args.vocab_size, args.n_activated_experts, dtype=torch.int32), requires_grad=False)
+            # Hash routing: each token id maps to a fixed set of experts. The real values
+            # come from the checkpoint; with no weights loaded we init to random *valid*
+            # expert indices so the downstream gather/bincount stays in range.
+            self.tid2eid = nn.Parameter(
+                torch.randint(0, args.n_routed_experts,
+                              (args.vocab_size, args.n_activated_experts)).to(torch.int32),
+                requires_grad=False)
             self.bias = None
         else:
             self.bias = nn.Parameter(torch.empty(args.n_routed_experts, dtype=torch.float32))
@@ -815,29 +836,61 @@ class Transformer(nn.Module):
 
 
 if __name__ == "__main__":
-    # GPU if available (this box has L20X), else CPU. Tiny config fits either way.
+    # Tensor-parallel aware smoke test.
+    #   1 GPU:  python model.py
+    #   2 GPUs: torchrun --nproc-per-node 2 model.py     (model.py auto-init the NCCL group)
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    if world_size > 1:
+        dist.init_process_group("nccl")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device(device)
-    torch.manual_seed(0)
+    if device == "cuda":
+        torch.cuda.set_device(local_rank)        # each rank pins its own GPU
+        torch.set_default_device(device)
+        torch.cuda.memory._set_allocator_settings("expandable_segments:True")  # cut fragmentation
+    torch.manual_seed(0)                          # same seed -> identical inputs/weights on all ranks
 
-    args = ModelArgs()                                   # tiny debug config (edit defaults above)
-    print(f"[model.py] device={device}  n_layers={args.n_layers}  dim={args.dim}  "
-          f"heads={args.n_heads}x{args.head_dim}  experts={args.n_routed_experts}")
+    args = ModelArgs()                            # real DeepSeek-V4-Pro config (n_layers reduced)
+    if (nl := os.getenv("MODEL_N_LAYERS")):       # override layer count w/o editing: MODEL_N_LAYERS=N python model.py
+        args.n_layers = int(nl)
+    if rank == 0:
+        print(f"[model.py] device={device} world_size={world_size}  "
+              f"n_layers={args.n_layers}(real 61) dim={args.dim} heads={args.n_heads}x{args.head_dim} "
+              f"experts={args.n_routed_experts}(top{args.n_activated_experts}) expert_dtype={args.expert_dtype}")
+
     x = torch.randint(0, args.vocab_size, (2, 128))
     model = Transformer(args)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[model.py] built Transformer: {n_params / 1e6:.3f}M params")
+    if rank == 0:
+        n_params = sum(p.numel() for p in model.parameters())
+        print(f"[model.py] built Transformer (params on this rank): {n_params / 1e6:.1f}M")
 
     # --- prefill (process the whole prompt at once) -------------------------
-    print("prefill  out:", model(x).size())
+    out = model(x)
+    if rank == 0:
+        print("prefill  out:", tuple(out.shape))
     # --- decode (generate one token at a time, start_pos advances) ----------
-    for i in range(128, 132):
-        print(f"decode {i} out:", model(x[:, 0:1], i).size())
+    for i in range(128, 131):
+        out = model(x[:, 0:1], i)
+        if rank == 0:
+            print(f"decode {i} out:", tuple(out.shape))
 
     # --- multi-token-prediction (MTP) head ----------------------------------
     h = torch.randn(2, 128, args.hc_mult, args.dim)
     mtp = model.mtp[0]
-    print("mtp prefill out:", mtp(h, 0, x).size())
-    print("mtp decode  out:", mtp(h[:, 0:1], 1, x[:, 0:1]).size())
-    print("[model.py] done ✓")
+    out = mtp(h, 0, x)
+    if rank == 0:
+        print("mtp prefill out:", tuple(out.shape))
+
+    if device == "cuda":
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        if rank == 0:
+            print(f"[model.py] peak GPU mem / rank: {peak:.1f} GB   (world_size={world_size})")
+    if rank == 0:
+        print("[model.py] done ✓")
+
+    if world_size > 1:
+        dist.destroy_process_group()

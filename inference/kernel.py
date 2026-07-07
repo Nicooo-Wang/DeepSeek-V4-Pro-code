@@ -149,20 +149,41 @@ def fp8_gemm(a, a_s, b, b_s, scale_dtype: torch.dtype = torch.float32) -> torch.
     return c.reshape(*lead, N).to(torch.get_default_dtype())
 
 
+_FP4_LUT = None
+def _fp4_to_f32(b: torch.Tensor) -> torch.Tensor:
+    """Unpack a packed ``float4_e2m1fn_x2`` weight ``[N, K//2]`` to logical ``[N, K]`` float32.
+
+    torch 2.8 cannot cast float4_e2m1fn_x2 -> float (CPU NotImplementedError / CUDA assert),
+    so we reinterpret the raw bytes as uint8, split low/high nibbles, and map each 4-bit
+    e2m1 code to its value via a 16-entry LUT. Packing convention: low nibble = even-index
+    element, high nibble = odd-index element (standard PyTorch ``_x2`` layout). With no
+    checkpoint loaded the exact values are irrelevant; this preserves correct *shapes* and
+    a valid fp4 decode so the structure is identical to the real model.
+    """
+    global _FP4_LUT
+    if _FP4_LUT is None or _FP4_LUT.device != b.device:
+        # e2m1 (sign, 2 exp, 1 mantissa, bias 1): 0,.5,1,1.5,2,3,4,6 and negatives
+        _FP4_LUT = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6.,
+                                 -0., -.5, -1., -1.5, -2., -3., -4., -6.], device=b.device)
+    u = b.view(torch.uint8)                                  # [N, K//2] raw bytes
+    low = (u & 0x0F).long()
+    high = ((u >> 4) & 0x0F).long()
+    return torch.stack([_FP4_LUT[low], _FP4_LUT[high]], dim=-1).reshape(b.size(0), -1)  # [N, K]
+
+
 def fp4_gemm(a, a_s, b, b_s, scale_dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """C[...,N] = A_fp8[...,K] @ B_fp4[N,K]^T (pure-torch reference).
 
-    Act scale ``a_s`` is per 128 on K; weight scale ``b_s`` is per 32 on K (e8m0).
-    Only reached when ``expert_dtype == "fp4"``. The activation side is handled fully;
-    the FP4 weight is treated as already-unpacked float (the packed
-    ``float4_e2m1fn_x2`` nibble layout of the real kernel is not unpacked here).
+    Reached when ``expert_dtype == "fp4"`` (the real DeepSeek-V4-Pro routed experts).
+    Act scale ``a_s`` is per 128 on K (e8m0); weight scale ``b_s`` is per 32 on K (e8m0).
+    ``b`` is the packed FP4 weight ``[N, K//2]`` -> unpacked to logical ``[N, K]``.
     """
     lead = a.shape[:-1]
     K = a.size(-1)
     N = b.size(0)
     a2 = a.reshape(-1, K)
     a_d = a2.float() * _scale_to_f32(a_s).reshape(a2.size(0), -1).repeat_interleave(128, dim=1)
-    b_d = b.float() * _scale_to_f32(b_s).repeat_interleave(32, dim=1)           # [N, K]
+    b_d = _fp4_to_f32(b) * _scale_to_f32(b_s).repeat_interleave(32, dim=1)            # [N, K]
     c = a_d @ b_d.T
     return c.reshape(*lead, N).to(torch.get_default_dtype())
 
